@@ -1,19 +1,30 @@
+import math
 import torch
 from torch import nn, einsum
 
-from einops import rearrange, repeat
+from einops import rearrange
 
 # translated from tensorflow code
 # https://gist.github.com/aravindsrinivas/56359b79f0ce4449bcb04ab4b56a57a2
 
 # positional embedding helpers
 
+def pair(x):
+    return (x, x) if not isinstance(x, tuple) else x
+
+def expand_dim(t, dim, k):
+    t = t.unsqueeze(dim = dim)
+    expand_shape = [-1] * len(t.shape)
+    expand_shape[dim] = k
+    return t.expand(*expand_shape)
+
 def rel_to_abs(x):
     b, h, l, _, device, dtype = *x.shape, x.device, x.dtype
-    col_pad = torch.zeros((b, h, l, 1), device = device, dtype = dtype)
+    dd = {'device': device, 'dtype': dtype}
+    col_pad = torch.zeros((b, h, l, 1), **dd)
     x = torch.cat((x, col_pad), dim = 3)
     flat_x = rearrange(x, 'b h l c -> b h (l c)')
-    flat_pad = torch.zeros((b, h, l - 1), dtype = dtype)
+    flat_pad = torch.zeros((b, h, l - 1), **dd)
     flat_x_padded = torch.cat((flat_x, flat_pad), dim = 2)
     final_x = flat_x_padded.reshape(b, h, l + 1, 2 * l - 1)
     final_x = final_x[:, :, :l, (l-1):]
@@ -21,11 +32,11 @@ def rel_to_abs(x):
 
 def relative_logits_1d(q, rel_k):
     b, heads, h, w, dim = q.shape
-    logits = einsum('b h x y d, r d -> b h x y r', q, rel_k) * dim ** -0.5
+    logits = einsum('b h x y d, r d -> b h x y r', q, rel_k)
     logits = rearrange(logits, 'b h x y r -> b (h x) y r')
     logits = rel_to_abs(logits)
     logits = logits.reshape(b, heads, h, w, w)
-    logits = repeat(logits, 'b h x y j -> b h x i y j', i = h)
+    logits = expand_dim(logits, dim = 3, k = h)
     return logits
 
 # positional embeddings
@@ -37,15 +48,15 @@ class AbsPosEmb(nn.Module):
         dim_head
     ):
         super().__init__()
+        height, width = pair(fmap_size)
         scale = dim_head ** -0.5
-        self.scale = scale
-        self.height = nn.Parameter(torch.randn(fmap_size, dim_head) * scale)
-        self.width = nn.Parameter(torch.randn(fmap_size, dim_head) * scale)
+        self.height = nn.Parameter(torch.randn(height, dim_head) * scale)
+        self.width = nn.Parameter(torch.randn(width, dim_head) * scale)
 
     def forward(self, q):
         emb = rearrange(self.height, 'h d -> h () d') + rearrange(self.width, 'w d -> () w d')
         emb = rearrange(emb, ' h w d -> (h w) d')
-        logits = einsum('b h i d, j d -> b h i j', q, emb) * self.scale
+        logits = einsum('b h i d, j d -> b h i j', q, emb)
         return logits
 
 class RelPosEmb(nn.Module):
@@ -55,14 +66,16 @@ class RelPosEmb(nn.Module):
         dim_head
     ):
         super().__init__()
+        height, width = pair(fmap_size)
         scale = dim_head ** -0.5
         self.fmap_size = fmap_size
-        self.scale = scale
-        self.rel_height = nn.Parameter(torch.randn(fmap_size * 2 - 1, dim_head) * scale)
-        self.rel_width = nn.Parameter(torch.randn(fmap_size * 2 - 1, dim_head) * scale)
+        self.rel_height = nn.Parameter(torch.randn(height * 2 - 1, dim_head) * scale)
+        self.rel_width = nn.Parameter(torch.randn(width * 2 - 1, dim_head) * scale)
 
     def forward(self, q):
-        q = rearrange(q, 'b h (x y) d -> b h x y d', x = self.fmap_size)
+        h, w = self.fmap_size
+
+        q = rearrange(q, 'b h (x y) d -> b h x y d', x = h, y = w)
         rel_logits_w = relative_logits_1d(q, self.rel_width)
         rel_logits_w = rearrange(rel_logits_w, 'b h x i y j-> b h (x y) (i j)')
 
@@ -99,7 +112,9 @@ class Attention(nn.Module):
         q, k, v = self.to_qkv(fmap).chunk(3, dim = 1)
         q, k, v = map(lambda t: rearrange(t, 'b (h d) x y -> b h (x y) d', h = heads), (q, k, v))
 
-        sim = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        q *= self.scale
+
+        sim = einsum('b h i d, b h j d -> b h i j', q, k)
         sim += self.pos_emb(q)
 
         attn = sim.softmax(dim = -1)
@@ -139,23 +154,24 @@ class BottleBlock(nn.Module):
 
         # contraction and expansion
 
-        attention_dim = dim_out // proj_factor
+        attn_dim_in = dim_out // proj_factor
+        attn_dim_out = heads * dim_head
 
         self.net = nn.Sequential(
-            nn.Conv2d(dim, attention_dim, 1, bias = False),
-            nn.BatchNorm2d(attention_dim),
+            nn.Conv2d(dim, attn_dim_in, 1, bias = False),
+            nn.BatchNorm2d(attn_dim_in),
             activation,
             Attention(
-                dim = attention_dim,
+                dim = attn_dim_in,
                 fmap_size = fmap_size,
                 heads = heads,
                 dim_head = dim_head,
                 rel_pos_emb = rel_pos_emb
             ),
             nn.AvgPool2d((2, 2)) if downsample else nn.Identity(),
-            nn.BatchNorm2d(attention_dim),
+            nn.BatchNorm2d(attn_dim_out),
             activation,
-            nn.Conv2d(attention_dim, dim_out, 1, bias = False),
+            nn.Conv2d(attn_dim_out, dim_out, 1, bias = False),
             nn.BatchNorm2d(dim_out)
         )
 
@@ -191,6 +207,8 @@ class BottleStack(nn.Module):
         activation = nn.ReLU()
     ):
         super().__init__()
+        fmap_size = pair(fmap_size)
+
         self.dim = dim
         self.fmap_size = fmap_size
 
@@ -200,7 +218,9 @@ class BottleStack(nn.Module):
             is_first = i == 0
             dim = (dim if is_first else dim_out)
             layer_downsample = is_first and downsample
-            layer_fmap_size = fmap_size // (2 if downsample and not is_first else 1)
+
+            fmap_divisor = (2 if downsample and not is_first else 1)
+            layer_fmap_size = tuple(map(lambda t: t // fmap_divisor, fmap_size))
 
             layers.append(BottleBlock(
                 dim = dim,
@@ -219,5 +239,5 @@ class BottleStack(nn.Module):
     def forward(self, x):
         _, c, h, w = x.shape
         assert c == self.dim, f'channels of feature map {c} must match channels given at init {self.dim}'
-        assert h == self.fmap_size and w == self.fmap_size, f'height and width of feature map must match the fmap_size given at init {self.fmap_size}'
+        assert h == self.fmap_size[0] and w == self.fmap_size[1], f'height and width ({h} {w}) of feature map must match the fmap_size given at init {self.fmap_size}'
         return self.net(x)
